@@ -352,10 +352,11 @@ async def remind(interaction: discord.Interaction, mode: str = "both"):
                 if user_obj is None:
                     user_obj = await bot.fetch_user(int(discord_id))
                 dm_text = (f"تذكير من بوت الضرائب:\n"
-                           f"يا {name}, لم يتم تسجيل دفع الضريبة اليوم.\n"
+                           f"يا {name}, مدفعتش الضريبة اليوم يا نجم.\n"
                            f"المبلغ المطلوب اليوم: ${due}\n"
                            f"استخدم /pay <amount> أو اطلب من الأدمن يسجّلك.\n"
-                           f"— War Era Tax Bot")
+                           f"هتدفع يعني هتدفع.\n"
+                           f"— صندوق تحيا مصر")
                 await user_obj.send(dm_text)
                 sent += 1
             except Exception as e:
