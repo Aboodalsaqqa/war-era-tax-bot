@@ -208,6 +208,139 @@ async def on_ready():
     print(f"Bot ready as {bot.user} (id: {bot.user.id})")
 
 # ----------------- Slash commands -----------------
+import asyncio
+import os
+
+# Optional env vars (add these in Railway Variables)
+# LOG_CHANNEL_ID -- channel id where admins get summary (optional)
+# REMINDER_ENABLED -- "true" to enable daily loop (optional)
+# REMINDER_HOUR -- hour in 24h (0-23) when daily reminders run (optional)
+REMINDER_ENABLED = os.environ.get("REMINDER_ENABLED", "false").lower() == "true"
+REMINDER_HOUR = int(os.environ.get("REMINDER_HOUR", "12"))  # default noon
+LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID")) if os.environ.get("LOG_CHANNEL_ID") else LOG_CHANNEL_ID
+
+# ---------------- reminder helpers ----------------
+async def send_dm_safe(user: discord.User, content: str):
+    try:
+        await user.send(content)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+async def gather_unpaid_players():
+    rows = get_all_players()  # (discord_id,name,level,factories,last_paid_date,last_paid_amount)
+    today = date.today().isoformat()
+    unpaid = []
+    for discord_id, name, level, factories, last_paid_date, last_paid_amount in rows:
+        if last_paid_date != today:
+            amt = total_tax(level, factories)
+            unpaid.append({
+                "discord_id": discord_id,
+                "name": name,
+                "level": level,
+                "factories": factories,
+                "due": amt
+            })
+    return unpaid
+
+async def send_reminders_to_unpaid(mode="dm_and_admin", interaction: discord.Interaction = None):
+    """
+    mode: "dm" -> only DM players
+          "admin" -> only send admin summary to LOG_CHANNEL_ID or ephemeral reply
+          "dm_and_admin" -> do both
+    interaction: if provided (command call), used to reply to invoker (ephemeral)
+    """
+    unpaid = await gather_unpaid_players()
+    if not unpaid:
+        if interaction:
+            await interaction.response.send_message("كل اللاعبين دفعوا اليوم ✅", ephemeral=True)
+        return {"sent": 0, "failed": []}
+
+    sent = 0
+    failed = []
+
+    # 1) DM each unpaid player (private)
+    if mode in ("dm", "dm_and_admin"):
+        for p in unpaid:
+            try:
+                # try to get User object (cached) then fetch if necessary
+                user_obj = bot.get_user(int(p["discord_id"]))
+                if user_obj is None:
+                    user_obj = await bot.fetch_user(int(p["discord_id"]))
+                dm_text = (f"تذكير من بوت الضرائب:\n"
+                           f"يا {p['name']}, لم يتم تسجيل دفع الضريبة اليوم.\n"
+                           f"المبلغ المطلوب اليوم: ${p['due']}\n"
+                           f"استخدم /pay <amount> أو اطلب من الأدمن يسجّلك.\n"
+                           f"— War Era Tax Bot")
+                ok, err = await send_dm_safe(user_obj, dm_text)
+                if ok:
+                    sent += 1
+                else:
+                    failed.append({"id": p["discord_id"], "name": p["name"], "error": err})
+                # small delay to avoid hitting rate limits; adjust as needed
+                await asyncio.sleep(0.8)
+            except Exception as e:
+                failed.append({"id": p["discord_id"], "name": p["name"], "error": str(e)})
+
+    # 2) Build admin summary
+    admin_text = f"تذكير: قائمة اللاعبين الذين لم يدفعوا اليوم ({len(unpaid)}):\n"
+    for p in unpaid:
+        admin_text += f"- {p['name']} (Lvl {p['level']}, Factories {p['factories']}) — Due ${p['due']}\n"
+
+    # include failures
+    if failed:
+        admin_text += "\nفشل في إرسال DM لـ:\n"
+        for f in failed:
+            admin_text += f"- {f['name']} (id: {f['id']}) — {f.get('error')}\n"
+
+    # 3) Send admin summary to LOG_CHANNEL_ID if configured, otherwise reply to interaction (ephemeral)
+    if mode in ("admin", "dm_and_admin"):
+        sent_to_log = False
+        if LOG_CHANNEL_ID:
+            # try to find the guild context: if interaction exists -> use its guild, else try all guilds
+            try:
+                ch = None
+                if interaction and interaction.guild:
+                    ch = interaction.guild.get_channel(LOG_CHANNEL_ID) or await interaction.guild.fetch_channel(LOG_CHANNEL_ID)
+                else:
+                    # try find any guild that has that channel id
+                    for g in bot.guilds:
+                        if g is None:
+                            continue
+                        try:
+                            c = g.get_channel(LOG_CHANNEL_ID)
+                            if c:
+                                ch = c
+                                break
+                        except Exception:
+                            continue
+                if ch:
+                    # respect length limits by chunking
+                    chunk_size = 1900
+                    for i in range(0, len(admin_text), chunk_size):
+                        await ch.send(admin_text[i:i+chunk_size])
+                    sent_to_log = True
+            except Exception as e:
+                # can't send to log channel
+                if interaction:
+                    await interaction.followup.send(f"لم أستطع إرسال ملخص الأدمن للقناة المحددة: {e}", ephemeral=True)
+        if not sent_to_log and interaction:
+            # reply ephemerally to the admin invoker
+            # chunk if long
+            if len(admin_text) <= 1900:
+                await interaction.response.send_message(admin_text, ephemeral=True)
+            else:
+                # send the first chunk as response, followups for the rest
+                await interaction.response.send_message(admin_text[:1900], ephemeral=True)
+                for i in range(1900, len(admin_text), 1900):
+                    await interaction.followup.send(admin_text[i:i+1900], ephemeral=True)
+
+    # 4) If only DM mode and interaction provided, confirm how many sent
+    if mode == "dm" and interaction:
+        await interaction.response.send_message(f"تم إرسال {sent} رسائل خاصة. (فشل: {len(failed)})", ephemeral=True)
+
+    return {"sent": sent, "failed": failed}
+
 @app_commands.command(name="admin_register", description="(Admin) Register a player manually")
 @app_commands.describe(
     member="The player you want to register",
@@ -348,6 +481,95 @@ async def history(interaction: discord.Interaction, member: discord.Member = Non
     await interaction.response.send_message(text, ephemeral=True)
 
 # Admin-only / powerful commands
+# ---------- Utility: update player fields ----------
+def update_player_field(discord_id: str, field: str, value):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if field not in ("level", "factories", "last_paid_date", "last_paid_amount", "name"):
+        conn.close()
+        raise ValueError("Invalid field")
+    c.execute(f'UPDATE players SET {field} = ? WHERE discord_id = ?', (value, discord_id))
+    conn.commit()
+    conn.close()
+
+# ---------- Commands to change level / factories ----------
+@app_commands.command(name="level_up", description="Increase level for you or a member (admin can change others)")
+@app_commands.describe(member="Member to level up (admin only)", amount="How many levels to add (default 1)")
+async def level_up(interaction: discord.Interaction, amount: int = 1, member: discord.Member = None):
+    if amount < 1:
+        await interaction.response.send_message("Amount must be >= 1.", ephemeral=True)
+        return
+
+    target = member or interaction.user
+    # if targeting other member -> must be admin
+    if member and not await is_user_tax_admin(interaction):
+        await interaction.response.send_message("Admin only to modify other players.", ephemeral=True)
+        return
+
+    row = get_player(str(target.id))
+    if not row:
+        await interaction.response.send_message("Player not registered. Use /register first.", ephemeral=True)
+        return
+
+    _, name, level, factories, last_paid_date, last_paid_amount = row
+    new_level = max(1, level + amount)
+    update_player_field(str(target.id), "level", new_level)
+    await interaction.response.send_message(f"✅ {target.display_name} level: {level} → {new_level}", ephemeral=(not member))
+
+@app_commands.command(name="add_factories", description="Add factories for you or a member (admin can change others)")
+@app_commands.describe(member="Member to add factories for (admin only)", amount="How many factories to add (default 1)")
+async def add_factories(interaction: discord.Interaction, amount: int = 1, member: discord.Member = None):
+    if amount < 1:
+        await interaction.response.send_message("Amount must be >= 1.", ephemeral=True)
+        return
+
+    target = member or interaction.user
+    if member and not await is_user_tax_admin(interaction):
+        await interaction.response.send_message("Admin only to modify other players.", ephemeral=True)
+        return
+
+    row = get_player(str(target.id))
+    if not row:
+        await interaction.response.send_message("Player not registered. Use /register first.", ephemeral=True)
+        return
+
+    _, name, level, factories, last_paid_date, last_paid_amount = row
+    new_factories = max(0, factories + amount)
+    update_player_field(str(target.id), "factories", new_factories)
+    await interaction.response.send_message(f"✅ {target.display_name} factories: {factories} → {new_factories}", ephemeral=(not member))
+
+@app_commands.command(name="set_level", description="(Admin) Set exact level for a player")
+@app_commands.describe(member="Member to set level for", level="Level to set (>=1)")
+async def set_level(interaction: discord.Interaction, member: discord.Member, level: int):
+    if not await is_user_tax_admin(interaction):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    if level < 1:
+        await interaction.response.send_message("Level must be >= 1.", ephemeral=True)
+        return
+    row = get_player(str(member.id))
+    if not row:
+        await interaction.response.send_message("Player not registered.", ephemeral=True)
+        return
+    update_player_field(str(member.id), "level", level)
+    await interaction.response.send_message(f"✅ Set {member.display_name} level to {level}.", ephemeral=True)
+
+@app_commands.command(name="set_factories", description="(Admin) Set exact number of factories for a player")
+@app_commands.describe(member="Member to set factories for", factories="Number of factories (>=0)")
+async def set_factories(interaction: discord.Interaction, member: discord.Member, factories: int):
+    if not await is_user_tax_admin(interaction):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    if factories < 0:
+        await interaction.response.send_message("Factories must be >= 0.", ephemeral=True)
+        return
+    row = get_player(str(member.id))
+    if not row:
+        await interaction.response.send_message("Player not registered.", ephemeral=True)
+        return
+    update_player_field(str(member.id), "factories", factories)
+    await interaction.response.send_message(f"✅ Set {member.display_name} factories to {factories}.", ephemeral=True)
+
 @app_commands.command(name="grant", description="Grant tax-admin to a user (bot-admin table)")
 @app_commands.describe(member="Member to grant")
 async def grant(interaction: discord.Interaction, member: discord.Member):
@@ -437,8 +659,14 @@ async def dashboard(interaction: discord.Interaction):
 
 # register commands to tree
 bot.tree.add_command(register)
+bot.tree.add_command(admin_register)
 bot.tree.add_command(tax)
+bot.tree.add_command(remind)
 bot.tree.add_command(pay)
+bot.tree.add_command(level_up)
+bot.tree.add_command(add_factories)
+bot.tree.add_command(set_level)
+bot.tree.add_command(set_factories)
 bot.tree.add_command(markpaid)
 bot.tree.add_command(history)
 bot.tree.add_command(grant)
