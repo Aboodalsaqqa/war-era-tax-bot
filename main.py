@@ -219,6 +219,108 @@ async def on_ready():
     print(f"Bot ready as {bot.user} (id: {bot.user.id})")
 
 # ----------------- Slash commands -----------------
+@app_commands.command(name="admin_register", description="(Admin) Register a player manually")
+@app_commands.describe(
+    member="The player you want to register",
+    level="Player level (1-999)",
+    factories="Number of factories"
+)
+async def admin_register(interaction: discord.Interaction, member: discord.Member, level: int, factories: int):
+    # admin check
+    if not await is_user_tax_admin(interaction):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+
+    if level < 1:
+        await interaction.response.send_message("Invalid level.", ephemeral=True)
+        return
+
+    # save to DB
+    upsert_player(str(member.id), member.name, level, factories)
+
+    await interaction.response.send_message(
+        f"✅ Registered **{member.name}** — level **{level}**, factories **{factories}**",
+        ephemeral=True
+    )
+
+@app_commands.command(name="level_up", description="Increase level for you or a member (admin can change others)")
+@app_commands.describe(member="Member to level up (admin only)", amount="How many levels to add (default 1)")
+async def level_up(interaction: discord.Interaction, amount: int = 1, member: discord.Member = None):
+    if amount < 1:
+        await interaction.response.send_message("Amount must be >= 1.", ephemeral=True)
+        return
+
+    target = member or interaction.user
+    # if targeting other member -> must be admin
+    if member and not await is_user_tax_admin(interaction):
+        await interaction.response.send_message("Admin only to modify other players.", ephemeral=True)
+        return
+
+    row = get_player(str(target.id))
+    if not row:
+        await interaction.response.send_message("Player not registered. Use /register first.", ephemeral=True)
+        return
+
+    _, name, level, factories, last_paid_date, last_paid_amount = row
+    new_level = max(1, level + amount)
+    update_player_field(str(target.id), "level", new_level)
+    # ephemeral for self, visible confirmation for admin actions
+    await interaction.response.send_message(f"✅ {target.display_name} level: {level} → {new_level}", ephemeral=(member is None))
+
+@app_commands.command(name="add_factories", description="Add factories for you or a member (admin can change others)")
+@app_commands.describe(member="Member to add factories for (admin only)", amount="How many factories to add (default 1)")
+async def add_factories(interaction: discord.Interaction, amount: int = 1, member: discord.Member = None):
+    if amount < 1:
+        await interaction.response.send_message("Amount must be >= 1.", ephemeral=True)
+        return
+
+    target = member or interaction.user
+    if member and not await is_user_tax_admin(interaction):
+        await interaction.response.send_message("Admin only to modify other players.", ephemeral=True)
+        return
+
+    row = get_player(str(target.id))
+    if not row:
+        await interaction.response.send_message("Player not registered. Use /register first.", ephemeral=True)
+        return
+
+    _, name, level, factories, last_paid_date, last_paid_amount = row
+    new_factories = max(0, factories + amount)
+    update_player_field(str(target.id), "factories", new_factories)
+    await interaction.response.send_message(f"✅ {target.display_name} factories: {factories} → {new_factories}", ephemeral=(member is None))
+
+@app_commands.command(name="set_level", description="(Admin) Set exact level for a player")
+@app_commands.describe(member="Member to set level for", level="Level to set (>=1)")
+async def set_level(interaction: discord.Interaction, member: discord.Member, level: int):
+    if not await is_user_tax_admin(interaction):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    if level < 1:
+        await interaction.response.send_message("Level must be >= 1.", ephemeral=True)
+        return
+    row = get_player(str(member.id))
+    if not row:
+        await interaction.response.send_message("Player not registered.", ephemeral=True)
+        return
+    update_player_field(str(member.id), "level", level)
+    await interaction.response.send_message(f"✅ Set {member.display_name} level to {level}.", ephemeral=True)
+
+@app_commands.command(name="set_factories", description="(Admin) Set exact number of factories for a player")
+@app_commands.describe(member="Member to set factories for", factories="Number of factories (>=0)")
+async def set_factories(interaction: discord.Interaction, member: discord.Member, factories: int):
+    if not await is_user_tax_admin(interaction):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+    if factories < 0:
+        await interaction.response.send_message("Factories must be >= 0.", ephemeral=True)
+        return
+    row = get_player(str(member.id))
+    if not row:
+        await interaction.response.send_message("Player not registered.", ephemeral=True)
+        return
+    update_player_field(str(member.id), "factories", factories)
+    await interaction.response.send_message(f"✅ Set {member.display_name} factories to {factories}.", ephemeral=True)
+
 @app_commands.command(name="remind", description="(Admin) Remind unpaid players for today")
 @app_commands.describe(mode="dm / admin / both")
 async def remind(interaction: discord.Interaction, mode: str = "both"):
@@ -473,14 +575,23 @@ async def dashboard(interaction: discord.Interaction):
 # register commands to tree
 bot.tree.add_command(remind)
 bot.tree.add_command(register)
+bot.tree.add_command(admin_register)   # <-- سهل الوصول للأدمن لتسجيل لاعبين
 bot.tree.add_command(tax)
 bot.tree.add_command(pay)
 bot.tree.add_command(markpaid)
 bot.tree.add_command(history)
+
+# level / factories management
+bot.tree.add_command(level_up)
+bot.tree.add_command(add_factories)
+bot.tree.add_command(set_level)
+bot.tree.add_command(set_factories)
+
 bot.tree.add_command(grant)
 bot.tree.add_command(revoke)
 bot.tree.add_command(unpaid)
 bot.tree.add_command(dashboard)
+
 
 # --------------- Run ---------------
 if not BOT_TOKEN:
