@@ -208,6 +208,30 @@ async def on_ready():
     print(f"Bot ready as {bot.user} (id: {bot.user.id})")
 
 # ----------------- Slash commands -----------------
+@app_commands.command(name="admin_register", description="(Admin) Register a player manually")
+@app_commands.describe(
+    member="The player you want to register",
+    level="Player level (1-999)",
+    factories="Number of factories"
+)
+async def admin_register(interaction: discord.Interaction, member: discord.Member, level: int, factories: int):
+    # admin check
+    if not await is_user_tax_admin(interaction):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+
+    if level < 1:
+        await interaction.response.send_message("Invalid level.", ephemeral=True)
+        return
+
+    # save to DB
+    upsert_player(str(member.id), member.name, level, factories)
+
+    await interaction.response.send_message(
+        f"✅ Registered **{member.name}** — level **{level}**, factories **{factories}**",
+        ephemeral=True
+    )
+
 @app_commands.command(name="register", description="Register your level and number of factories (admin can register others)")
 @app_commands.describe(
     level="Player level (1-999)",
