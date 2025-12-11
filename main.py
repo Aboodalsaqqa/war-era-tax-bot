@@ -1,4 +1,247 @@
-# (تكملة الملف بعد /pay ...)
+# main.py — War Era Tax Bot (old full code) with updated dashboard + level/factories commands
+import os
+import sqlite3
+import discord
+from discord import app_commands
+from discord.ext import commands
+from datetime import date, datetime
+
+# ================== CONFIG ==================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# If you want commands to register instantly for testing, set your guild id(s) here:
+GUILD_IDS = None  # e.g. [123456789012345678]
+# Optional: restrict admin checks to a specific role (put role ID) or leave None
+ADMIN_ROLE_ID = None  # e.g. 987654321012345678
+# Optional: channel ID where logs/dashboards are posted (or None)
+LOG_CHANNEL_ID = None  # e.g. 234567890123456789
+# Database file
+DB_FILE = "tax_bot.db"
+# ============================================
+
+# Intents: do NOT request message_content or privileged intents
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ----------------- Database helpers -----------------
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # players table
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS players (
+        discord_id TEXT PRIMARY KEY,
+        name TEXT,
+        level INTEGER,
+        factories INTEGER,
+        last_paid_date TEXT,
+        last_paid_amount REAL
+    )''')
+    # payments table (history)
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        discord_id TEXT,
+        payer_name TEXT,
+        amount REAL,
+        proof TEXT,
+        admin_name TEXT,
+        timestamp TEXT
+    )''')
+    # bot admins table (users allowed to use admin commands via bot)
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS bot_admins (
+        discord_id TEXT PRIMARY KEY
+    )''')
+    conn.commit()
+    conn.close()
+
+def upsert_player(discord_id, name, level, factories):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+    INSERT INTO players(discord_id,name,level,factories,last_paid_date,last_paid_amount)
+    VALUES(?,?,?,?,?,?)
+    ON CONFLICT(discord_id) DO UPDATE SET
+      name=excluded.name,
+      level=excluded.level,
+      factories=excluded.factories
+    ''', (discord_id, name, level, factories, None, 0.0))
+    conn.commit()
+    conn.close()
+
+def mark_paid(discord_id, amount):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    today = date.today().isoformat()
+    c.execute('UPDATE players SET last_paid_date=?, last_paid_amount=? WHERE discord_id=?',
+              (today, amount, discord_id))
+    conn.commit()
+    conn.close()
+
+def add_payment_record(discord_id, payer_name, amount, proof, admin_name):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    ts = datetime.utcnow().isoformat()
+    c.execute('''
+        INSERT INTO payments(discord_id,payer_name,amount,proof,admin_name,timestamp)
+        VALUES(?,?,?,?,?,?)
+    ''', (discord_id, payer_name, amount, proof or "", admin_name, ts))
+    conn.commit()
+    conn.close()
+
+def get_all_players():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT discord_id,name,level,factories,last_paid_date,last_paid_amount FROM players')
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_player(discord_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT discord_id,name,level,factories,last_paid_date,last_paid_amount FROM players WHERE discord_id=?', (discord_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def add_bot_admin(discord_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO bot_admins(discord_id) VALUES(?)', (discord_id,))
+    conn.commit()
+    conn.close()
+
+def remove_bot_admin(discord_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('DELETE FROM bot_admins WHERE discord_id=?', (discord_id,))
+    conn.commit()
+    conn.close()
+
+def is_bot_admin_db(discord_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT 1 FROM bot_admins WHERE discord_id=?', (discord_id,))
+    r = c.fetchone()
+    conn.close()
+    return bool(r)
+
+def get_payment_history(discord_id, limit=20):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT payer_name,amount,proof,admin_name,timestamp FROM payments WHERE discord_id=? ORDER BY id DESC LIMIT ?', (discord_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+# ----------------- Tax calculation -----------------
+def tax_by_level(level):
+    if 1 <= level <= 4:
+        return 0.0
+    if 5 <= level <= 9:
+        return 1.0
+    if 10 <= level <= 15:
+        return 3.0
+    if 16 <= level <= 20:
+        return 5.5
+    if 21 <= level <= 25:
+        return 8.0
+    if 26 <= level <= 30:
+        return 12.0
+    return 12.0
+
+def total_tax(level, factories):
+    base = tax_by_level(level)
+    factory_tax = 0.0
+    if factories >= 3:
+        factory_tax = 0.5 * factories
+    return round(base + factory_tax, 2)
+
+# ----------------- Admin check helper -----------------
+async def is_user_tax_admin(interaction: discord.Interaction) -> bool:
+    # 1) Guild owner
+    try:
+        if interaction.guild is not None and interaction.guild.owner_id == interaction.user.id:
+            return True
+    except Exception:
+        pass
+
+    # 2) DB bot_admins
+    if is_bot_admin_db(str(interaction.user.id)):
+        return True
+
+    # 3) Guild permissions / role
+    if interaction.guild is None:
+        return False
+    try:
+        member = interaction.guild.get_member(interaction.user.id)
+        if member is None:
+            member = await interaction.guild.fetch_member(interaction.user.id)
+    except Exception:
+        member = None
+
+    if member:
+        if getattr(member.guild_permissions, "administrator", False):
+            return True
+        if ADMIN_ROLE_ID:
+            try:
+                if any(r.id == ADMIN_ROLE_ID for r in member.roles):
+                    return True
+            except Exception:
+                pass
+
+    return False
+
+# ----------------- Bot events & sync -----------------
+@bot.event
+async def on_ready():
+    init_db()
+    # sync commands
+    if GUILD_IDS:
+        for gid in GUILD_IDS:
+            guild = discord.Object(id=gid)
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+    else:
+        await bot.tree.sync()
+    print(f"Bot ready as {bot.user} (id: {bot.user.id})")
+
+# ----------------- Slash commands -----------------
+@app_commands.command(name="register", description="Register your level and number of factories")
+@app_commands.describe(level="Your player level (1-999)", factories="Number of factories you own")
+async def register(interaction: discord.Interaction, level: int, factories: int):
+    if level < 1:
+        await interaction.response.send_message("Invalid level.", ephemeral=True)
+        return
+    upsert_player(str(interaction.user.id), interaction.user.name, level, factories)
+    await interaction.response.send_message(f"Registered {interaction.user.name} — level {level}, factories {factories}", ephemeral=True)
+
+@app_commands.command(name="tax", description="Show today's tax for you or another player")
+@app_commands.describe(member="Member to check (optional)")
+async def tax(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    row = get_player(str(target.id))
+    if not row:
+        await interaction.response.send_message("Player not registered.", ephemeral=True)
+        return
+    _, name, level, factories, last_paid_date, last_paid_amount = row
+    t = total_tax(level, factories)
+    paid_today = (last_paid_date == date.today().isoformat())
+    await interaction.response.send_message(f"{name} — Level {level}, Factories {factories} → Daily tax: ${t} — Paid today: {paid_today}", ephemeral=True)
+
+@app_commands.command(name="pay", description="Mark your payment (you) or for another player (admin)")
+@app_commands.describe(member="Member who paid (optional)", amount="Amount paid, e.g. 5.5")
+async def pay(interaction: discord.Interaction, amount: float, member: discord.Member = None):
+    target = member or interaction.user
+    row = get_player(str(target.id))
+    if not row:
+        await interaction.response.send_message("Player not registered. Use /register first.", ephemeral=True)
+        return
+    # mark paid and add payment record (payer_name = target.name, admin_name = interaction.user.name)
+    mark_paid(str(target.id), amount)
+    add_payment_record(str(target.id), target.name, amount, None, interaction.user.name)
+    await interaction.response.send_message(f"Marked payment: {target.name} paid ${amount} today ✅", ephemeral=True)
 
 @app_commands.command(name="markpaid", description="(Admin) Mark a player as paid with optional proof URL")
 @app_commands.describe(member="Member who paid", amount="Amount paid", proof="Proof image URL (optional)")
@@ -140,6 +383,7 @@ async def set_factories(interaction: discord.Interaction, member: discord.Member
     update_player_field(str(member.id), "factories", factories)
     await interaction.response.send_message(f"✅ Set {member.display_name} factories to {factories}.", ephemeral=True)
 
+# Admin-only / powerful commands
 @app_commands.command(name="grant", description="Grant tax-admin to a user (bot-admin table)")
 @app_commands.describe(member="Member to grant")
 async def grant(interaction: discord.Interaction, member: discord.Member):
@@ -170,9 +414,7 @@ async def unpaid(interaction: discord.Interaction):
     for r in rows:
         discord_id, name, level, factories, last_paid_date, last_paid_amount = r
         t = total_tax(level, factories)
-        if last_paid_date != tod
-::contentReference[oaicite:0]{index=0}
-ay:
+        if last_paid_date != today:
             not_paid.append((name, t))
         else:
             total += last_paid_amount
@@ -249,4 +491,5 @@ if not BOT_TOKEN:
     print("ERROR: BOT_TOKEN environment variable not set. Add your bot token and retry.")
 else:
     bot.run(BOT_TOKEN)
+
 
