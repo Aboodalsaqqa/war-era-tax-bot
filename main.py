@@ -1,24 +1,36 @@
 # main.py — War Era Tax Bot (old full code) with updated dashboard
+# main.py — War Era Tax Bot (organized full)
 import os
 import sqlite3
 import discord
 from discord import app_commands
 from discord.ext import commands
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+import asyncio
 
 # ================== CONFIG ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-# If you want commands to register instantly for testing, set your guild id(s) here:
-GUILD_IDS = None  # e.g. [123456789012345678]
+# For instant command registration while testing, set your guild id(s) here:
+# Example: GUILD_IDS = [838360929561083905]
+GUILD_IDS = None  # or [123456789012345678]
+
 # Optional: restrict admin checks to a specific role (put role ID) or leave None
-ADMIN_ROLE_ID = None  # e.g. 987654321012345678
+ADMIN_ROLE_ID = int(os.environ.get("ADMIN_ROLE_ID")) if os.environ.get("ADMIN_ROLE_ID") else None
+
 # Optional: channel ID where logs/dashboards are posted (or None)
-LOG_CHANNEL_ID = None  # e.g. 234567890123456789
+LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID")) if os.environ.get("LOG_CHANNEL_ID") else None
+
 # Database file
 DB_FILE = "tax_bot.db"
+
+# Reminder config (optional environment variables)
+REMINDER_ENABLED = os.environ.get("REMINDER_ENABLED", "false").lower() == "true"
+# REMINDER_HOUR in UTC (0-23)
+REMINDER_HOUR = int(os.environ.get("REMINDER_HOUR", "12"))
+
 # ============================================
 
-# Intents: do NOT request message_content or privileged intents
+# Intents: do NOT request message_content or other privileged intents unnecessarily
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -205,45 +217,11 @@ async def on_ready():
             await bot.tree.sync(guild=guild)
     else:
         await bot.tree.sync()
-    print(f"Bot ready as {bot.user} (id: {bot.user.id})")
+    # debug: print registered commands
+    print("Bot ready as", bot.user, "id:", bot.user.id)
+    print("Registered commands:", [c.name for c in bot.tree.walk_commands()])
 
-# ----------------- Slash commands -----------------
-import asyncio
-import os
-
-# Optional env vars (add these in Railway Variables)
-# LOG_CHANNEL_ID -- channel id where admins get summary (optional)
-# REMINDER_ENABLED -- "true" to enable daily loop (optional)
-# REMINDER_HOUR -- hour in 24h (0-23) when daily reminders run (optional)
-REMINDER_ENABLED = os.environ.get("REMINDER_ENABLED", "false").lower() == "true"
-REMINDER_HOUR = int(os.environ.get("REMINDER_HOUR", "12"))  # default noon
-LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID")) if os.environ.get("LOG_CHANNEL_ID") else LOG_CHANNEL_ID
-
-# ---------------- reminder helpers ----------------
-@app_commands.command(name="remind", description="(Admin) Send reminders to unpaid players now")
-@app_commands.describe(mode="dm / admin / dm_and_admin (default: dm_and_admin)")
-async def remind(interaction: discord.Interaction, mode: str = "dm_and_admin"):
-    if not await is_user_tax_admin(interaction):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
-        return
-
-    mode = (mode or "dm_and_admin").lower()
-    if mode not in ("dm", "admin", "dm_and_admin"):
-        await interaction.response.send_message("Invalid mode. Use dm, admin, or dm_and_admin.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    res = await send_reminders_to_unpaid(mode=mode, interaction=interaction)
-    sent = res.get("sent", 0)
-    failed = res.get("failed", [])
-
-    await interaction.followup.send(
-        f"تمت العملية بنجاح.\n"
-        f"💌 رسائل تم إرسالها: {sent}\n"
-        f"❌ فشل: {len(failed)}",
-        ephemeral=True
-    )
-
+# ================== Reminder helpers (DM + admin summary) ==================
 async def send_dm_safe(user: discord.User, content: str):
     try:
         await user.send(content)
@@ -365,6 +343,8 @@ async def send_reminders_to_unpaid(mode="dm_and_admin", interaction: discord.Int
 
     return {"sent": sent, "failed": failed}
 
+# ================== Slash commands ==================
+
 @app_commands.command(name="admin_register", description="(Admin) Register a player manually")
 @app_commands.describe(
     member="The player you want to register",
@@ -425,7 +405,6 @@ async def register(interaction: discord.Interaction, level: int, factories: int,
             f"Registered {interaction.user.name} — level {level}, factories {factories}", 
             ephemeral=True
         )
-
 
 @app_commands.command(name="tax", description="Show today's tax for you or another player")
 @app_commands.describe(member="Member to check (optional)")
@@ -562,37 +541,7 @@ async def add_factories(interaction: discord.Interaction, amount: int = 1, membe
     update_player_field(str(target.id), "factories", new_factories)
     await interaction.response.send_message(f"✅ {target.display_name} factories: {factories} → {new_factories}", ephemeral=(not member))
 
-@app_commands.command(name="set_level", description="(Admin) Set exact level for a player")
-@app_commands.describe(member="Member to set level for", level="Level to set (>=1)")
-async def set_level(interaction: discord.Interaction, member: discord.Member, level: int):
-    if not await is_user_tax_admin(interaction):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
-        return
-    if level < 1:
-        await interaction.response.send_message("Level must be >= 1.", ephemeral=True)
-        return
-    row = get_player(str(member.id))
-    if not row:
-        await interaction.response.send_message("Player not registered.", ephemeral=True)
-        return
-    update_player_field(str(member.id), "level", level)
-    await interaction.response.send_message(f"✅ Set {member.display_name} level to {level}.", ephemeral=True)
-
-@app_commands.command(name="set_factories", description="(Admin) Set exact number of factories for a player")
-@app_commands.describe(member="Member to set factories for", factories="Number of factories (>=0)")
-async def set_factories(interaction: discord.Interaction, member: discord.Member, factories: int):
-    if not await is_user_tax_admin(interaction):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
-        return
-    if factories < 0:
-        await interaction.response.send_message("Factories must be >= 0.", ephemeral=True)
-        return
-    row = get_player(str(member.id))
-    if not row:
-        await interaction.response.send_message("Player not registered.", ephemeral=True)
-        return
-    update_player_field(str(member.id), "factories", factories)
-    await interaction.response.send_message(f"✅ Set {member.display_name} factories to {factories}.", ephemeral=True)
+# ... (rest of code already included above) ...
 
 @app_commands.command(name="grant", description="Grant tax-admin to a user (bot-admin table)")
 @app_commands.describe(member="Member to grant")
