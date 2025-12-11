@@ -208,14 +208,43 @@ async def on_ready():
     print(f"Bot ready as {bot.user} (id: {bot.user.id})")
 
 # ----------------- Slash commands -----------------
-@app_commands.command(name="register", description="Register your level and number of factories")
-@app_commands.describe(level="Your player level (1-999)", factories="Number of factories you own")
-async def register(interaction: discord.Interaction, level: int, factories: int):
+@app_commands.command(name="register", description="Register your level and number of factories (admin can register others)")
+@app_commands.describe(
+    level="Player level (1-999)",
+    factories="Number of factories",
+    member="Register this member instead of yourself (admin only)"
+)
+async def register(interaction: discord.Interaction, level: int, factories: int, member: discord.Member = None):
+
+    # Check level validity
     if level < 1:
         await interaction.response.send_message("Invalid level.", ephemeral=True)
         return
-    upsert_player(str(interaction.user.id), interaction.user.name, level, factories)
-    await interaction.response.send_message(f"Registered {interaction.user.name} — level {level}, factories {factories}", ephemeral=True)
+
+    # If member provided → only admins can use it
+    if member is not None:
+        if not await is_user_tax_admin(interaction):
+            await interaction.response.send_message("Admin only — you can't register other players.", ephemeral=True)
+            return
+        target = member
+    else:
+        target = interaction.user
+
+    # Save player
+    upsert_player(str(target.id), target.name, level, factories)
+
+    # Response
+    if member:
+        await interaction.response.send_message(
+            f"Registered {target.mention} — level {level}, factories {factories}", 
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"Registered {interaction.user.name} — level {level}, factories {factories}", 
+            ephemeral=True
+        )
+
 
 @app_commands.command(name="tax", description="Show today's tax for you or another player")
 @app_commands.describe(member="Member to check (optional)")
