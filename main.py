@@ -220,6 +220,30 @@ REMINDER_HOUR = int(os.environ.get("REMINDER_HOUR", "12"))  # default noon
 LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID")) if os.environ.get("LOG_CHANNEL_ID") else LOG_CHANNEL_ID
 
 # ---------------- reminder helpers ----------------
+@app_commands.command(name="remind", description="(Admin) Send reminders to unpaid players now")
+@app_commands.describe(mode="dm / admin / dm_and_admin (default: dm_and_admin)")
+async def remind(interaction: discord.Interaction, mode: str = "dm_and_admin"):
+    if not await is_user_tax_admin(interaction):
+        await interaction.response.send_message("Admin only.", ephemeral=True)
+        return
+
+    mode = (mode or "dm_and_admin").lower()
+    if mode not in ("dm", "admin", "dm_and_admin"):
+        await interaction.response.send_message("Invalid mode. Use dm, admin, or dm_and_admin.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    res = await send_reminders_to_unpaid(mode=mode, interaction=interaction)
+    sent = res.get("sent", 0)
+    failed = res.get("failed", [])
+
+    await interaction.followup.send(
+        f"تمت العملية بنجاح.\n"
+        f"💌 رسائل تم إرسالها: {sent}\n"
+        f"❌ فشل: {len(failed)}",
+        ephemeral=True
+    )
+
 async def send_dm_safe(user: discord.User, content: str):
     try:
         await user.send(content)
