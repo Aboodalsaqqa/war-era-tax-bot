@@ -634,7 +634,7 @@ async def dashboard(interaction: discord.Interaction):
 bot.tree.add_command(register)
 bot.tree.add_command(admin_register)
 bot.tree.add_command(tax)
-bot.tree.add_command(remind)
+#bot.tree.add_command(remind)
 bot.tree.add_command(pay)
 bot.tree.add_command(level_up)
 bot.tree.add_command(add_factories)
